@@ -1,3 +1,4 @@
+from typing import Any
 from cuquantum.densitymat import DensePureState, DenseMixedState
 
 import numpy as np
@@ -11,6 +12,11 @@ try:
     from qutip_cupy import CuPyDense
 except ImportError:
     CuPyDense = None
+
+try:
+    import mpi4py.MPI as MPI
+except ImportError:
+    MPI = None
 
 def ensure_copy(x):
     return x if x.base is None else x.copy()
@@ -32,19 +38,21 @@ class CuState(Data):
                 hilbert_dims = arg.hilbert_space_dims
             base = arg
 
-        elif CuPyDense is not None and isinstance(arg, CuPyDense):
+        elif (CuPyDense is not None and isinstance(arg, CuPyDense)) or isinstance(arg, cp.ndarray):
+            if CuPyDense is not None and isinstance(arg, CuPyDense):
+                arg = arg._cp
             if shape is None:
                 shape = arg.shape
             if hilbert_dims is None:
                 hilbert_dims = arg.shape[:1]
 
-            if arg.shape[0] != np.prod(hilbert_dims) or arg.shape[1] != 1:
-                # TODO: Add sanity check for hilbert_dims
+            if arg.shape[0] != 1 and arg.shape[1] != 1:
+                assert arg.shape[0] == np.prod(hilbert_dims) and arg.shape[1] == np.prod(hilbert_dims), "Shape does not match hilbert_dims"
                 base = DenseMixedState(ctx, hilbert_dims, 1, "complex128")
                 sizes, offsets = base.local_info
                 sls = tuple(slice(s, s+n) for s, n in zip(offsets, sizes))[:-1]
                 N = np.prod(sizes)
-                if len(arg._cp) == N:
+                if len(arg) == N:
                     base.attach_storage(cp.array(
                         arg._cp
                         .reshape(hilbert_dims * 2)[sls]
@@ -54,7 +62,7 @@ class CuState(Data):
                 else:
                     base.allocate_storage()
                     base.storage[:N] = (
-                        arg._cp
+                        arg
                         .reshape(hilbert_dims * 2)[sls]
                         .ravel(order="F")
                     )
@@ -64,16 +72,16 @@ class CuState(Data):
                 sizes, offsets = base.local_info
                 sls = tuple(slice(s, s+n) for s, n in zip(offsets, sizes))[:-1]
                 N = np.prod(sizes)
-                if len(arg._cp) == N:
+                if len(arg) == N:
                     base.attach_storage(cp.array(
-                        arg._cp
+                        arg
                         .reshape(hilbert_dims)[sls]
                         .ravel(order="F"), copy=copy
                     ))
                 else:
                     base.allocate_storage()
                     base.storage[:N] = (
-                        arg._cp
+                        arg
                         .reshape(hilbert_dims)[sls]
                         .ravel(order="F")
                     )
@@ -124,17 +132,25 @@ class CuState(Data):
         return self.to_cupy(as_tensor).get()
 
     def to_cupy(self, as_tensor=False):
-        # TODO: How to implement for mpi?
         if type(self.base) is DenseMixedState:
             tensor_shape = self.base.hilbert_space_dims * 2
         else:
             tensor_shape = self.base.hilbert_space_dims
+
+        local_tensor = self.base.view()[..., 0]
         if self.base.local_info[0][:-1] != tensor_shape:
-            raise NotImplementedError(
-                "Not Implemented for MPI distributed array."
-                f"{self.base.local_info[0][:-1]} vs {self.base.hilbert_space_dims}"
-            )
-        tensor = self.base.view()[..., 0]
+            if MPI is None:
+                raise ImportError("mpi4py is not imported. Distributed tensor assembly requires mpi4py.")
+            comm = MPI.COMM_WORLD
+            tensor = cp.empty(tensor_shape, dtype=cp.complex128)
+            sizes, offsets = self.base.local_info
+            local_sls = tuple(slice(s, s+n) for s, n in zip(offsets, sizes))[:-1]
+            all_sls = comm.allgather(local_sls)
+            all_tensor = comm.allgather(local_tensor)
+            for rank in range(comm.Get_size()):
+                tensor[all_sls[rank]] = all_tensor[rank]
+        else:
+            tensor = local_tensor
         if not as_tensor:
             tensor = tensor.reshape(*self.shape, order="C")
         return tensor
@@ -181,29 +197,12 @@ class CuState(Data):
 
     def transpose(self):
         arr = self.to_cupy().transpose()
-        if(type(self.base) is DenseMixedState):
-            arr = arr.reshape(self.base.hilbert_space_dims * 2).ravel("F")
-        else:
-            arr = arr.reshape(self.base.hilbert_space_dims).ravel("F")
-        arr = ensure_copy(arr)
-        return CuState(
-            self.base.clone(arr),
-            shape=(self.shape[1], self.shape[0])
-        )
+        return CuState(arr, hilbert_dims=self.base.hilbert_space_dims, shape=(self.shape[1], self.shape[0]))
 
 
     def adjoint(self):
-        arr = self.to_cupy().transpose()
-        if(type(self.base) is DenseMixedState):
-            arr = arr.reshape(self.base.hilbert_space_dims * 2).ravel("F")
-
-        else:
-            arr = arr.reshape(self.base.hilbert_space_dims).ravel("F")
-        arr = arr.conj()
-        return CuState(
-            self.base.clone(arr),
-            shape=(self.shape[1], self.shape[0])
-        )
+        arr = self.to_cupy().transpose().conj()
+        return CuState(arr, hilbert_dims=self.base.hilbert_space_dims, shape=(self.shape[1], self.shape[0]))
 
 def CuState_from_Dense(mat):
     return CuState(mat)
@@ -360,23 +359,14 @@ def matmul_cuState(left, right):
 
     output_shape = (left.shape[0], right.shape[1])
     ctx = settings.cuDensity["ctx"]
-    hilbert_dims = left.base.hilbert_space_dims
+    if(left.shape[0] == 1 and right.shape[1] == 1):
+        # Scalar case
+        hilbert_dims = (1,)    
+    else:
+        hilbert_dims = left.base.hilbert_space_dims
 
     left_array = left.to_cupy()
     right_array = right.to_cupy()
     arr = left_array @ right_array
     
-    if(left.shape[0] == 1 and right.shape[1] == 1):
-        # Scalar case
-        base = DensePureState(ctx, (1,), 1, "complex128")
-    elif(output_shape[0] == 1 or output_shape[1] == 1):
-        base = DensePureState(ctx, hilbert_dims, 1, "complex128")
-        arr = arr.reshape(hilbert_dims).ravel(order="F")
-    else:        
-        base = DenseMixedState(ctx, hilbert_dims, 1, "complex128")
-        arr = arr.reshape(hilbert_dims * 2).ravel(order="F")
-
-    # Make sure the array is not a view, to avoid later error in cuDM view() method
-    arr = ensure_copy(arr)
-    base.attach_storage(arr)
-    return CuState(base, shape=output_shape)
+    return CuState(arr, hilbert_dims=hilbert_dims, shape=output_shape)
