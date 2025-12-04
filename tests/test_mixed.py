@@ -34,7 +34,6 @@ _compatible_op_state = [
     (pytest.param((-6,), id="single_weak"), pytest.param((2, 3, StateType.KET), id="2-ket")),
     (pytest.param((2, -4), id="double_weak"), pytest.param((2, 2, 2, StateType.DM), id="3-dm")),
     (pytest.param((2, 2, 2), id="triple"), pytest.param((2, 2, 2, StateType.KET), id="3-ket")),
-    # (pytest.param((2, 2, 2, 2, 2, 2), id="triple supeop"), pytest.param((2, 2, 2, StateType.DM_VECTOR), id="3-dm_vector")),
 ]
 
 _imcompatible_op_state = [
